@@ -66,6 +66,19 @@ def pil_from_page(page, dpi=200):
     pix = page.get_pixmap(dpi=dpi)
     return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
+
+def filter_json_blocks(obj, drop_headers_footers = True):
+    """Removes header/footer blocks from the JSON object if requested."""
+    if not drop_headers_footers or "blocks" not in obj:
+        return obj
+    obj["blocks"] = [
+        b for b in obj.get("blocks", [])
+        if b.get("category") not in ("Page-header", "Page-footer")
+    ]
+    return obj
+
+
+
 def parse_json_flex(s: str):
     s = s.strip()
     if s.startswith("{") and s.endswith("}"):
@@ -120,7 +133,7 @@ def prepare_inputs(img, prompt_text, processor, device, dtype):
             inputs[k] = v
     return inputs
 
-def run_inference(model, inputs, max_new_tokens=1536):
+def run_inference(model, inputs, max_new_tokens=15360):
     with torch.inference_mode():
         return model.generate(**inputs, max_new_tokens=max_new_tokens, temperature=None, do_sample=False)
 
@@ -138,11 +151,14 @@ def get_initial_session_state():
         }
     }
 
-def create_temp_session_dir():
+def create_session_dir():
+    """Creates a dedicated, persistent directory for session outputs in ./gradio_output."""
+    output_root = "gradio_output"
+    os.makedirs(output_root, exist_ok=True)
     session_id = uuid.uuid4().hex[:8]
-    temp_dir = os.path.join(tempfile.gettempdir(), f"dots_ocr_demo_{session_id}")
-    os.makedirs(temp_dir, exist_ok=True)
-    return temp_dir, session_id
+    session_dir = os.path.join(output_root, f"session_{session_id}")
+    os.makedirs(session_dir, exist_ok=True)
+    return session_dir, session_id
 
 def load_file_for_preview(file_path, session_state):
     pdf_cache = session_state['pdf_cache']
@@ -204,15 +220,19 @@ def update_prompt_display(prompt_mode):
 # --- Core Local Inference Function ------------------------------------------
 def process_file_local(session_state, test_image_input, file_input, prompt_mode):
     if not MODEL or not PROCESSOR:
-        return None, "Error: Model not loaded. Check console for errors.", "", "", gr.update(value=None), None, "", session_state
+        yield None, "Error: Model not loaded. Check console for errors.", "", "", gr.update(value=None), None, "", session_state
+        return
 
     input_path = file_input if file_input else test_image_input
     if not input_path:
-        return None, "Please upload a file or select an example.", "", "", gr.update(value=None), None, "", session_state
+        yield None, "Please upload a file or select an example.", "", "", gr.update(value=None), None, "", session_state
+        return
 
-    # Setup temp dir
-    temp_dir, session_id = create_temp_session_dir()
-    session_state['processing_results'].update({'temp_dir': temp_dir, 'session_id': session_id})
+    # Setup session directory
+    session_dir, session_id = create_session_dir()
+    abs_session_dir = os.path.abspath(session_dir)
+    print(f"[INFO] Session results are being saved to: {abs_session_dir}")
+    session_state['processing_results'].update({'temp_dir': session_dir, 'session_id': session_id})
 
     pdf_cache = session_state['pdf_cache']
     images_to_process = pdf_cache.get("images", [])
@@ -223,63 +243,104 @@ def process_file_local(session_state, test_image_input, file_input, prompt_mode)
     prompt_text = dict_promptmode_to_prompt.get(prompt_mode, "")
     all_results = []
     all_md_content = []
+    total_pages = len(images_to_process)
+    
+    # Initial message with output location
+    initial_info_text = f"**Output Location:** `{abs_session_dir}`\n\n**Local Inference Details:**\n- Device: {DEVICE}\n- Total Pages: {total_pages}\n- Session ID: {session_id}"
 
     for i, img in enumerate(images_to_process):
         page_num = i + 1
+        
+        # Update UI to show progress before processing
+        info_text = f"{initial_info_text}\n\n**Processing page {page_num}/{total_pages}...**"
+        page_info_html = f"<div id='page_info_box'>{page_num} / {total_pages}</div>"
+        processing_md = "\n\n---\n\n".join(all_md_content) + f"\n\n---\n\n*⏳ Processing page {page_num}...*"
+        
+        yield (
+            img, info_text, processing_md, processing_md,
+            gr.update(visible=False), page_info_html, "Processing...", session_state
+        )
+
+        out_text = None
         try:
             inputs = prepare_inputs(img, prompt_text, PROCESSOR, DEVICE, DTYPE)
             out_ids = run_inference(MODEL, inputs)
             out_text = decode_output(out_ids, inputs, PROCESSOR)
             
             parsed_json = parse_json_flex(out_text)
-            page_info = {"blocks": parsed_json} if isinstance(parsed_json, list) else parsed_json
+            
+            # Normalize the structure to always be a dictionary with a 'blocks' key
+            if isinstance(parsed_json, list):
+                page_info = {"blocks": parsed_json}
+            else:
+                page_info = parsed_json
+
+            # Now, filter the blocks within the unified structure
+            page_info = filter_json_blocks(page_info)
+
             page_info.update({"page": page_num, "width": img.width, "height": img.height})
             
             md_content = layoutjson2md(img, page_info.get('blocks', []), text_key='text')
             
-            all_results.append({'json_data': page_info, 'md_content': md_content})
+            current_page_result = {'json_data': page_info, 'md_content': md_content}
+            all_results.append(current_page_result)
             all_md_content.append(md_content)
 
             # Save artifacts
-            json_path = os.path.join(temp_dir, f"page_{page_num}.json")
-            md_path = os.path.join(temp_dir, f"page_{page_num}.md")
+            json_path = os.path.join(session_dir, f"page_{page_num}.json")
+            md_path = os.path.join(session_dir, f"page_{page_num}.md")
             with open(json_path, "w", encoding="utf-8") as f: json.dump(page_info, f, ensure_ascii=False, indent=2)
             with open(md_path, "w", encoding="utf-8") as f: f.write(md_content)
 
         except Exception as e:
-            error_message = f"Failed to process page {page_num}: {e}"
-            all_results.append({'json_data': {'error': error_message}, 'md_content': f"## {error_message}"})
+            print(f"[ERROR] Failed to process page {page_num}: {e}, output: {out_text}")
+            error_message = f"Failed to process page {page_num}: {e}, output: {out_text}"
+            current_page_result = {'json_data': {'error': error_message}, 'md_content': f"## {error_message}"}
+            all_results.append(current_page_result)
             all_md_content.append(f"## {error_message}")
         finally:
             # Clean up memory after each page
-            del img
             if 'inputs' in locals(): del inputs
             if 'out_ids' in locals(): del out_ids
             gc.collect()
             if DEVICE == "mps": torch.mps.empty_cache()
 
-    pdf_cache.update({"is_parsed": True, "results": all_results})
-    
-    # Prepare final outputs for UI
-    first_result = all_results[0]
-    first_image = images_to_process[0]
-    combined_md = "\n\n---\n\n".join(all_md_content)
-    first_page_json_str = json.dumps(first_result.get('json_data', {}), ensure_ascii=False, indent=2)
-    
-    info_text = f"**Local Inference Details:**\n- Device: {DEVICE}\n- Total Pages: {len(images_to_process)}\n- Session ID: {session_id}"
-    
+        # Update session state after processing the page
+        pdf_cache["results"] = all_results
+        pdf_cache["current_page"] = i
+        session_state['pdf_cache'] = pdf_cache
+
+        # Yield the result for the current page
+        combined_md = "\n\n---\n\n".join(all_md_content)
+        current_page_json_str = json.dumps(current_page_result.get('json_data', {}), ensure_ascii=False, indent=2)
+        
+        yield (
+            img, info_text, combined_md, combined_md,
+            gr.update(visible=False), page_info_html, current_page_json_str, session_state
+        )
+
+    # After the loop, do final updates
+    pdf_cache.update({"is_parsed": True, "results": all_results, "current_page": 0})
+    session_state['pdf_cache'] = pdf_cache
+
     # Create zip for download
-    download_zip_path = os.path.join(temp_dir, f"results_{session_id}.zip")
+    download_zip_path = os.path.join(session_dir, f"results_{session_id}.zip")
     with zipfile.ZipFile(download_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        for root, _, files in os.walk(temp_dir):
+        for root, _, files in os.walk(session_dir):
             for file in files:
                 if not file.endswith('.zip'):
-                    zipf.write(os.path.join(root, file), os.path.relpath(os.path.join(root, file), temp_dir))
+                    zipf.write(os.path.join(root, file), os.path.relpath(os.path.join(root, file), session_dir))
 
-    return (
-        first_image, info_text, combined_md, combined_md,
+    # Final yield to set the first page view and enable download
+    final_info_text = f"{initial_info_text}\n\n**✅ Processing complete.**"
+    combined_md = "\n\n---\n\n".join(all_md_content)
+    first_page_json_str = json.dumps(all_results[0].get('json_data', {}), ensure_ascii=False, indent=2) if all_results else "{}"
+    first_image = images_to_process[0] if images_to_process else None
+    
+    yield (
+        first_image, final_info_text, combined_md, combined_md,
         gr.update(value=download_zip_path, visible=True),
-        f"<div id='page_info_box'>1 / {len(images_to_process)}</div>",
+        f"<div id='page_info_box'>1 / {total_pages}</div>",
         first_page_json_str, session_state
     )
 
