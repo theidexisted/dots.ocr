@@ -24,6 +24,9 @@ import gc
 import fitz  # PyMuPDF
 import torch
 from transformers import AutoConfig, AutoProcessor, AutoModelForCausalLM
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from starlette.responses import RedirectResponse
 
 # Local tool imports
 from dots_ocr.utils import dict_promptmode_to_prompt
@@ -60,6 +63,7 @@ MAX_PIX_MODEL = 640 * 28 * 28 * 4
 # These are loaded once at startup.
 MODEL = None
 PROCESSOR = None
+SESSIONS = {}
 
 # --- M1/MPS-specific Helpers from m1.py -------------------------------------
 def pil_from_page(page, dpi=200):
@@ -144,21 +148,20 @@ def decode_output(out_ids, inputs, processor):
 # --- Gradio App Helpers (Adapted from demo_gradio.py) -----------------------
 def get_initial_session_state():
     return {
-        'processing_results': { 'temp_dir': None, 'session_id': None },
+        'processing_results': { 'temp_dir': None, 'session_id': None, 'status': 'idle' },
         'pdf_cache': {
             "images": [], "current_page": 0, "total_pages": 0,
             "file_type": None, "is_parsed": False, "results": []
         }
     }
 
-def create_session_dir():
+def create_session_dir(session_id):
     """Creates a dedicated, persistent directory for session outputs in ./gradio_output."""
     output_root = "gradio_output"
     os.makedirs(output_root, exist_ok=True)
-    session_id = uuid.uuid4().hex[:8]
     session_dir = os.path.join(output_root, f"session_{session_id}")
     os.makedirs(session_dir, exist_ok=True)
-    return session_dir, session_id
+    return session_dir
 
 def load_file_for_preview(file_path, session_state):
     pdf_cache = session_state['pdf_cache']
@@ -217,19 +220,35 @@ def clear_all_data(session_state):
 def update_prompt_display(prompt_mode):
     return dict_promptmode_to_prompt.get(prompt_mode, "Unknown prompt mode.")
 
+def get_or_create_session(token=None):
+    if token and token in SESSIONS:
+        return token, SESSIONS[token]
+    token = uuid.uuid4().hex
+    SESSIONS[token] = get_initial_session_state()
+    return token, SESSIONS[token]
+
 # --- Core Local Inference Function ------------------------------------------
-def process_file_local(session_state, test_image_input, file_input, prompt_mode):
+def process_file_local(session_token, test_image_input, file_input, prompt_mode):
+    if not session_token:
+        session_token, _ = get_or_create_session()
+
+    session_state = SESSIONS[session_token]
+    session_state['processing_results']['status'] = 'processing'
+
     if not MODEL or not PROCESSOR:
-        yield None, "Error: Model not loaded. Check console for errors.", "", "", gr.update(value=None), None, "", session_state
+        session_state['processing_results']['status'] = 'error'
+        yield None, "Error: Model not loaded. Check console for errors.", "", "", gr.update(value=None), None, "", session_state, session_token
         return
 
     input_path = file_input if file_input else test_image_input
     if not input_path:
-        yield None, "Please upload a file or select an example.", "", "", gr.update(value=None), None, "", session_state
+        session_state['processing_results']['status'] = 'error'
+        yield None, "Please upload a file or select an example.", "", "", gr.update(value=None), None, "", session_state, session_token
         return
 
     # Setup session directory
-    session_dir, session_id = create_session_dir()
+    session_id = session_token
+    session_dir = create_session_dir(session_id)
     abs_session_dir = os.path.abspath(session_dir)
     print(f"[INFO] Session results are being saved to: {abs_session_dir}")
     session_state['processing_results'].update({'temp_dir': session_dir, 'session_id': session_id})
@@ -258,7 +277,7 @@ def process_file_local(session_state, test_image_input, file_input, prompt_mode)
         
         yield (
             img, info_text, processing_md, processing_md,
-            gr.update(visible=False), page_info_html, "Processing...", session_state
+            gr.update(visible=False), page_info_html, "Processing...", session_state, session_token
         )
 
         out_text = None
@@ -316,12 +335,14 @@ def process_file_local(session_state, test_image_input, file_input, prompt_mode)
         
         yield (
             img, info_text, combined_md, combined_md,
-            gr.update(visible=False), page_info_html, current_page_json_str, session_state
+            gr.update(visible=False), page_info_html, current_page_json_str, session_state, session_token
         )
 
     # After the loop, do final updates
     pdf_cache.update({"is_parsed": True, "results": all_results, "current_page": 0})
     session_state['pdf_cache'] = pdf_cache
+    session_state['processing_results']['status'] = 'completed'
+
 
     # Create zip for download
     download_zip_path = os.path.join(session_dir, f"results_{session_id}.zip")
@@ -341,7 +362,7 @@ def process_file_local(session_state, test_image_input, file_input, prompt_mode)
         first_image, final_info_text, combined_md, combined_md,
         gr.update(value=download_zip_path, visible=True),
         f"<div id='page_info_box'>1 / {total_pages}</div>",
-        first_page_json_str, session_state
+        first_page_json_str, session_state, session_token
     )
 
 # --- Gradio Interface Creation ----------------------------------------------
@@ -356,8 +377,15 @@ def create_gradio_interface():
     #info_box { padding: 10px; background-color: #f8f9fa; border-radius: 8px; border: 1px solid #dee2e6; margin: 10px 0; font-size: 14px; }
     """
     with gr.Blocks(theme="ocean", css=css, title='dots.ocr (M1 Local)') as demo:
-        session_state = gr.State(value=get_initial_session_state())
         
+        def on_load(request: gr.Request):
+            token = request.query_params.get("token")
+            token, session_state = get_or_create_session(token)
+            return {session_token: gr.update(value=token), session_state_component: session_state}
+
+        session_token = gr.Textbox(label="Session Token", interactive=False)
+        session_state_component = gr.State()
+
         gr.HTML("""
             <div style="display: flex; align-items: center; justify-content: center; margin-bottom: 20px;">
                 <h1 style="margin: 0; font-size: 2em;">🔍 dots.ocr (macOS/M1 Local)</h1>
@@ -399,7 +427,7 @@ def create_gradio_interface():
                         gr.Markdown("### ✔️ Result Display")
                         with gr.Tabs():
                             with gr.TabItem("Markdown Render"):
-                                md_output = gr.Markdown("## Click 'Parse Locally' to begin...", elem_id="markdown_output", latex_delimiters=[{"left": "$$", "right": "$$", "display": True}])
+                                md_output = gr.Markdown("## Click 'Parse Locally' to begin...", elem_id="markdown_output", latex_delimiters=[{"left": "$", "right": "$", "display": True}])
                             with gr.TabItem("Markdown Raw"):
                                 md_raw_output = gr.Textbox("...", label="Markdown Raw Text", lines=38, show_copy_button=True, show_label=False)
                             with gr.TabItem("Current Page JSON"):
@@ -408,21 +436,22 @@ def create_gradio_interface():
                 download_btn = gr.DownloadButton("⬇️ Download Results", visible=False)
 
         # Event Handlers
+        demo.load(on_load, None, [session_token, session_state_component])
         prompt_mode.change(fn=update_prompt_display, inputs=prompt_mode, outputs=prompt_display)
-        file_input.upload(fn=load_file_for_preview, inputs=[file_input, session_state], outputs=[result_image, page_info, session_state])
-        test_image_input.change(fn=load_file_for_preview, inputs=[test_image_input, session_state], outputs=[result_image, page_info, session_state])
+        file_input.upload(fn=load_file_for_preview, inputs=[file_input, session_state_component], outputs=[result_image, page_info, session_state_component])
+        test_image_input.change(fn=load_file_for_preview, inputs=[test_image_input, session_state_component], outputs=[result_image, page_info, session_state_component])
         
-        prev_btn.click(fn=lambda s: turn_page("prev", s), inputs=[session_state], outputs=[result_image, page_info, current_page_json, session_state])
-        next_btn.click(fn=lambda s: turn_page("next", s), inputs=[session_state], outputs=[result_image, page_info, current_page_json, session_state])
+        prev_btn.click(fn=lambda s: turn_page("prev", s), inputs=[session_state_component], outputs=[result_image, page_info, current_page_json, session_state_component])
+        next_btn.click(fn=lambda s: turn_page("next", s), inputs=[session_state_component], outputs=[result_image, page_info, current_page_json, session_state_component])
         
         process_btn.click(
             fn=process_file_local,
-            inputs=[session_state, test_image_input, file_input, prompt_mode],
-            outputs=[result_image, info_display, md_output, md_raw_output, download_btn, page_info, current_page_json, session_state]
+            inputs=[session_token, test_image_input, file_input, prompt_mode],
+            outputs=[result_image, info_display, md_output, md_raw_output, download_btn, page_info, current_page_json, session_state_component, session_token]
         )
         clear_btn.click(
-            fn=clear_all_data, inputs=[session_state],
-            outputs=[file_input, test_image_input, result_image, info_display, md_output, md_raw_output, download_btn, page_info, current_page_json, session_state]
+            fn=clear_all_data, inputs=[session_state_component],
+            outputs=[file_input, test_image_input, result_image, info_display, md_output, md_raw_output, download_btn, page_info, current_page_json, session_state_component]
         )
     return demo
 
@@ -445,7 +474,21 @@ if __name__ == "__main__":
         print(f"[ERROR] Failed to load the model: {e}")
         sys.exit(1)
 
+    app = FastAPI()
+
+    @app.get("/api/job/{token}")
+    def get_job_status(token: str):
+        if token not in SESSIONS:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return SESSIONS[token]['processing_results']
+
+    @app.get("/")
+    def root():
+        return RedirectResponse(url="/gradio")
+
     demo = create_gradio_interface()
+    app = gr.mount_gradio_app(app, demo, path="/gradio")
+    
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 7860
-    print(f"[INFO] Launching Gradio interface on http://0.0.0.0:{port}")
-    demo.queue().launch(server_name="0.0.0.0", server_port=port, debug=True)
+    print(f"[INFO] Launching Gradio interface on http://0.0.0.0:{port}/gradio")
+    uvicorn.run(app, host="0.0.0.0", port=port)
