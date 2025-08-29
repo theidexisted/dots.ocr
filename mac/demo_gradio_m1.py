@@ -1,9 +1,9 @@
-"""
+'''
 Gradio Demo for dots.ocr on macOS/M1
 - Runs the model locally using MPS acceleration.
 - Self-contained, no external server needed.
 - Based on the original Gradio demo and the M1 command-line script.
-"""
+'''
 
 import gradio as gr
 import json
@@ -27,6 +27,249 @@ from transformers import AutoConfig, AutoProcessor, AutoModelForCausalLM
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from starlette.responses import RedirectResponse
+from openai import OpenAI
+import logging
+from tqdm import tqdm
+import glob
+from typing import List, Tuple
+
+pageLimit = 0
+
+class PDFMerger:
+    def __init__(self, api_base: str, model: str = "gpt-3.5-turbo"):
+        """初始化PDF合并器"""
+        self.api_base = api_base
+        self.model = model
+        
+        # 创建独立的logger实例
+        self.logger = logging.getLogger("PDFMerger")
+        self.logger.setLevel(logging.INFO)
+        
+        # 避免重复添加handler
+        if not self.logger.handlers:
+            # 文件handler
+            file_handler = logging.FileHandler("merger.log", encoding='utf-8')
+            file_handler.setLevel(logging.INFO)
+            
+            # 控制台handler
+            console_handler = logging.StreamHandler()
+            console_handler.setLevel(logging.INFO)
+            
+            # 格式化
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            file_handler.setFormatter(formatter)
+            #console_handler.setFormatter(formatter)
+            
+            self.logger.addHandler(file_handler)
+            #self.logger.addHandler(console_handler)
+        
+        # 配置OpenAI客户端
+        self.client = OpenAI(
+            base_url=api_base,
+            api_key="dummy" # The key can be anything, it is ignored by the local server
+        )
+
+    def read_ocr_files(self, input_dir: str) -> List[Tuple[str, str]]:
+        """读取所有OCR文件内容和路径"""
+        file_pattern = os.path.join(input_dir, "*.md")
+        files = sorted(glob.glob(file_pattern), key=lambda x: int(re.findall(r'\d+', os.path.basename(x))[0]))
+
+        global pageLimit
+        if pageLimit is not None and pageLimit > 0:
+            files = files[:pageLimit]
+            self.logger.info(f"限制处理前 {pageLimit} 页")
+        
+        contents = []
+        for file_path in tqdm(files, desc="读取OCR文件"):
+            with open(file_path, 'r', encoding='utf-8') as f:
+                contents.append((file_path, f.read().strip()))
+        
+        return contents
+    def remove_think_blocks_simple(self, text):
+        """
+        Remove <think>...</think> blocks using string methods.
+        
+        Args:
+            text (str): Input string containing <think> blocks
+            
+        Returns:
+            str: String with all <think> blocks removed
+        """
+        result = text
+        while True:
+            start = result.find('<think>')
+            if start == -1:
+                break
+                
+            end = result.find('</think>', start)
+            if end == -1:
+                break
+                
+            # Remove the block including the tags
+            result = result[:start] + result[end + 8:]  # 8 = len('</think>')
+        
+        return result
+
+    def remove_unnecessary_spaces(self, content: str, file_path: str) -> str:
+        """使用AI删除正文中不应该存在的空格"""
+        prompt = f"""
+请处理以下 markdown 文本，删除正文中不应该存在的空格，但保留标题、列表等特殊格式中的空格。
+
+处理规则：
+1. 删除中文文本中不必要的空格（中文通常不需要单词间的空格）
+2. 保留英文单词之间的必要空格
+3. 保留标题、列表项等格式中的空格
+4. 保留代码块、URL等特殊内容中的空格
+5. 保留标点符号周围的正常格式
+6. 修复标题换行问题，确保标题都是单独一行，且标题前后有空行
+7. 同时注意标题是否中间混入了 # 字符，如果有请删掉
+
+请直接返回处理后的文本，不要添加任何解释。
+
+需要处理的文本：
+{content}
+"""
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "你是一个 Markdown 文本处理助手，专门清理文本中不必要的空格。以及修复标题换行问题"},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1  # 低温度以确保一致性
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            self.logger.error(f"空格清理API调用失败: {os.path.basename(file_path)}")
+            self.logger.error(f"错误: {e}")
+            # 如果API调用失败，返回原始内容
+            return content
+
+    def preprocess_ocr_contents(self, contents_with_paths: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+        """预处理OCR内容，删除不必要的空格"""
+        processed_contents = []
+        
+        for file_path, content in tqdm(contents_with_paths, desc="清理空格"):
+            if content.strip():  # 只处理非空内容
+                processed_content = self.remove_think_blocks_simple(self.remove_unnecessary_spaces(content, file_path))
+                self.logger.info(f"已处理空格: {os.path.basename(file_path)}, old content:\n{content}\nnew content:\n{processed_content}")
+                processed_contents.append((file_path, processed_content))
+            else:
+                processed_contents.append((file_path, content))
+        
+        return processed_contents
+
+    def should_merge_pages(self, last_line: str, next_first_line: str, prev_path: str, current_path: str) -> bool:
+        """使用AI判断两个页面之间的文本是否应该连接"""
+        prompt = f"""
+这两行文字是一本书里面连续两页分别做 OCR 的结果，现在根据上下文判断它们是否属于同一段落。
+上一页的最后一行是: "{last_line}"
+下一页的第一行是: "{next_first_line}"
+
+如果是同一段落请返回 True，否则返回 False。 请不要返回除此以外的其它内容。
+
+主要的思路：
+
+* 如果上一行没有以句号、问号、感叹号、引号结尾，则很可能是同一段落。
+* 如果下一行以中文标点开头，则很可能是同一段落。
+* 如果其中一个是标题，那肯定不是同一段落。
+* 其它情况要结合上下文进行判断。
+
+"""
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "你是一个文本分析助手，专门判断段落连续性。"},
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            answer = response.choices[0].message.content.strip().lower()
+            return "true" in answer
+        except Exception as e:
+            request_data = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": "你是一个文本分析助手，专门判断段落连续性。"},
+                    {"role": "user", "content": prompt}
+                ]
+            }
+            self.logger.error(f"API调用失败，处理文件: {os.path.basename(prev_path)} 和 {os.path.basename(current_path)}")
+            self.logger.error(f"错误: {e}")
+            self.logger.error(f"请求JSON:\n{json.dumps(request_data, indent=2, ensure_ascii=False)}")
+            # 如果API调用失败，默认为不合并
+            return False
+
+    def extract_context(self, page_content: str) -> Tuple[str, str]:
+        """提取页面的首行和末行"""
+        lines = [line.strip() for line in page_content.split("\n") if line.strip()]
+        first_line = lines[0] if lines else ""
+        last_line = lines[-1] if lines else ""
+        return first_line, last_line
+
+    def merge_ocr_contents(self, contents_with_paths: List[Tuple[str, str]]) -> str:
+        """合并OCR内容，处理页面间的连接问题"""
+        if not contents_with_paths:
+            return ""
+
+        paths = [p for p, c in contents_with_paths]
+        contents = [c for p, c in contents_with_paths]
+
+        merged_text = contents[0]
+        
+        for i in tqdm(range(1, len(contents)), desc="合并页面"):
+            prev_page_content = contents[i-1]
+            current_page_content = contents[i]
+            
+            prev_page_path = paths[i-1]
+            current_page_path = paths[i]
+
+            _, prev_last_line = self.extract_context(prev_page_content)
+            current_first_line, _ = self.extract_context(current_page_content)
+            self.logger.info(f"处理页面: {os.path.basename(prev_page_path)} 和 {os.path.basename(current_page_path)}")
+            self.logger.info(f"上一页最后一行: {prev_last_line}")
+            self.logger.info(f"下一页第一行: {current_first_line}")
+
+            if not prev_last_line or not current_first_line:
+                self.logger.info("其中一页为空，直接添加换行")
+                merged_text += "\n\n" + current_page_content
+                continue
+
+            if self.should_merge_pages(prev_last_line, current_first_line, prev_page_path, current_page_path):
+                self.logger.info("判断为同一段落，直接连接")
+                lines = current_page_content.split('\n')
+                merged_text = merged_text.rstrip() + lines[0]
+                if len(lines) > 1:
+                    merged_text += "\n" + "\n".join(lines[1:])
+            else:
+                self.logger.info("判断不是同一段落，添加换行")
+                merged_text += "\n\n" + current_page_content
+        
+        return merged_text
+
+    def process(self, input_dir: str, output_file: str) -> None:
+        """处理OCR文件并生成合并后的Markdown"""
+        self.logger.info(f"开始处理来自 {input_dir} 的OCR文件...")
+        ocr_files_data = self.read_ocr_files(input_dir)
+        
+        if not ocr_files_data:
+            self.logger.warning("未找到OCR文件!")
+            return
+        
+        self.logger.info(f"找到 {len(ocr_files_data)} 个OCR文件，开始清理空格...")
+        # 预处理内容，删除不必要的空格
+        processed_contents = self.preprocess_ocr_contents(ocr_files_data)
+        
+        self.logger.info("空格清理完成，开始合并页面...")
+        merged_content = self.merge_ocr_contents(processed_contents)
+        
+        # 写入合并后的内容到Markdown文件
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write(merged_content)
+        
+        self.logger.info(f"合并完成! 结果已保存至 {output_file}")
+
+
 
 # Local tool imports
 from dots_ocr.utils import dict_promptmode_to_prompt
@@ -145,6 +388,42 @@ def decode_output(out_ids, inputs, processor):
     trimmed_ids = [o[len(iids):] for iids, o in zip(inputs["input_ids"], out_ids)]
     return processor.batch_decode(trimmed_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
 
+def extract_and_save_images(md_content, base_path, page_num):
+    """
+    Extracts base64 embedded images from markdown, saves them as files,
+    and replaces the base64 URI with a file path.
+    """
+    # Make the image type in the regex optional. It now handles "data:image/jpeg;base64,..." and "data:image;base64,..."
+    img_pattern = re.compile(r"!\[(.*?)\]\(data:image;base64,(.*?)\)")
+    matches = list(img_pattern.finditer(md_content))
+    
+    for i, match in enumerate(matches):
+        alt_text = match.group(1)
+        img_type = match.group(3).lower()
+        b64_data = match.group(4)
+        
+        img_bytes = base64.b64decode(b64_data)
+        
+        if not img_type:
+            try:
+                with Image.open(io.BytesIO(img_bytes)) as img:
+                    img_type = img.format.lower()
+            except Exception as e:
+                print(f"Could not determine image type with Pillow: {e}")
+                img_type = 'jpeg' # Default to jpeg if detection fails
+
+        # Create a unique filename
+        img_filename = f"page_{page_num:03d}_image_{i+1}.{img_type}"
+        img_path = os.path.join(base_path, img_filename)
+        
+        with open(img_path, "wb") as f:
+            f.write(img_bytes)
+            
+        # Replace the base64 URI with the new file path in the markdown
+        md_content = md_content.replace(match.group(0), f"![{alt_text}]({img_filename})")
+        
+    return md_content
+
 # --- Gradio App Helpers (Adapted from demo_gradio.py) -----------------------
 def get_initial_session_state():
     return {
@@ -229,6 +508,10 @@ def get_or_create_session(token=None):
 
 # --- Core Local Inference Function ------------------------------------------
 def process_file_local(session_token, test_image_input, file_input, prompt_mode):
+    # --- Hardcoded API and Model for automatic merging ---
+    API_BASE = "http://127.0.0.1:1234/v1/"
+    MODEL_NAME = "openai/gpt-oss-20b"
+
     if not session_token:
         session_token, _ = get_or_create_session()
 
@@ -237,13 +520,13 @@ def process_file_local(session_token, test_image_input, file_input, prompt_mode)
 
     if not MODEL or not PROCESSOR:
         session_state['processing_results']['status'] = 'error'
-        yield None, "Error: Model not loaded. Check console for errors.", "", "", gr.update(value=None), None, "", session_state, session_token
+        yield None, "Error: Model not loaded. Check console for errors.", "", "", gr.update(value=None), None, "", session_state, session_token, ""
         return
 
     input_path = file_input if file_input else test_image_input
     if not input_path:
         session_state['processing_results']['status'] = 'error'
-        yield None, "Please upload a file or select an example.", "", "", gr.update(value=None), None, "", session_state, session_token
+        yield None, "Please upload a file or select an example.", "", "", gr.update(value=None), None, "", session_state, session_token, ""
         return
 
     # Setup session directory
@@ -277,7 +560,7 @@ def process_file_local(session_token, test_image_input, file_input, prompt_mode)
         
         yield (
             img, info_text, processing_md, processing_md,
-            gr.update(visible=False), page_info_html, "Processing...", session_state, session_token
+            gr.update(visible=False), page_info_html, "Processing...", session_state, session_token, ""
         )
 
         out_text = None
@@ -300,14 +583,15 @@ def process_file_local(session_token, test_image_input, file_input, prompt_mode)
             page_info.update({"page": page_num, "width": img.width, "height": img.height})
             
             md_content = layoutjson2md(img, page_info.get('blocks', []), text_key='text')
+            md_content = extract_and_save_images(md_content, session_dir, page_num)
             
             current_page_result = {'json_data': page_info, 'md_content': md_content}
             all_results.append(current_page_result)
             all_md_content.append(md_content)
 
             # Save artifacts
-            json_path = os.path.join(session_dir, f"page_{page_num}.json")
-            md_path = os.path.join(session_dir, f"page_{page_num}.md")
+            json_path = os.path.join(session_dir, f"page_{page_num:03d}.json")
+            md_path = os.path.join(session_dir, f"page_{page_num:03d}.md")
             with open(json_path, "w", encoding="utf-8") as f: json.dump(page_info, f, ensure_ascii=False, indent=2)
             with open(md_path, "w", encoding="utf-8") as f: f.write(md_content)
 
@@ -335,7 +619,7 @@ def process_file_local(session_token, test_image_input, file_input, prompt_mode)
         
         yield (
             img, info_text, combined_md, combined_md,
-            gr.update(visible=False), page_info_html, current_page_json_str, session_state, session_token
+            gr.update(visible=False), page_info_html, current_page_json_str, session_state, session_token, ""
         )
 
     # After the loop, do final updates
@@ -343,6 +627,18 @@ def process_file_local(session_token, test_image_input, file_input, prompt_mode)
     session_state['pdf_cache'] = pdf_cache
     session_state['processing_results']['status'] = 'completed'
 
+    # --- Automatic Merging and Cleaning ---
+    info_text = f"{initial_info_text}\n\n**✅ Processing complete. Now merging and cleaning...**"
+    yield (
+        images_to_process[0] if images_to_process else None, info_text, combined_md, combined_md,
+        gr.update(visible=False), f"<div id='page_info_box'>1 / {total_pages}</div>",
+        json.dumps(all_results[0].get('json_data', {}), ensure_ascii=False, indent=2) if all_results else "{}", 
+        session_state, session_token, "*Merging...*"
+    )
+
+    unload_model()
+    merged_content = merge_and_clean_pages_auto(session_state, API_BASE, MODEL_NAME)
+    load_model()
 
     # Create zip for download
     download_zip_path = os.path.join(session_dir, f"results_{session_id}.zip")
@@ -353,7 +649,7 @@ def process_file_local(session_token, test_image_input, file_input, prompt_mode)
                     zipf.write(os.path.join(root, file), os.path.relpath(os.path.join(root, file), session_dir))
 
     # Final yield to set the first page view and enable download
-    final_info_text = f"{initial_info_text}\n\n**✅ Processing complete.**"
+    final_info_text = f"{initial_info_text}\n\n**✅ Processing and merging complete.**"
     combined_md = "\n\n---\n\n".join(all_md_content)
     first_page_json_str = json.dumps(all_results[0].get('json_data', {}), ensure_ascii=False, indent=2) if all_results else "{}"
     first_image = images_to_process[0] if images_to_process else None
@@ -362,8 +658,51 @@ def process_file_local(session_token, test_image_input, file_input, prompt_mode)
         first_image, final_info_text, combined_md, combined_md,
         gr.update(value=download_zip_path, visible=True),
         f"<div id='page_info_box'>1 / {total_pages}</div>",
-        first_page_json_str, session_state, session_token
+        first_page_json_str, session_state, session_token, merged_content
     )
+
+def merge_and_clean_pages_auto(session_state, api_base, model_name):
+    session_dir = session_state['processing_results'].get('temp_dir')
+
+    if not session_dir or not os.path.exists(session_dir):
+        return "Error: No processed files found to merge."
+
+    try:
+        merger = PDFMerger(api_base=api_base, model=model_name)
+        
+        def process_and_return_merged(merger_instance, input_dir: str, output_filename: str) -> str:
+            merger_instance.logger.info(f"开始处理来自 {input_dir} 的OCR文件...")
+            ocr_files_data = merger_instance.read_ocr_files(input_dir)
+            
+            if not ocr_files_data:
+                merger_instance.logger.warning("未找到OCR文件!")
+                return "No .md files found in the session directory."
+            
+            merger_instance.logger.info(f"找到 {len(ocr_files_data)} 个OCR文件，开始清理空格...")
+            processed_contents = merger_instance.preprocess_ocr_contents(ocr_files_data)
+            
+            merger_instance.logger.info("空格清理完成，开始合并页面...")
+            merged_content = merger_instance.merge_ocr_contents(processed_contents)
+            
+            output_filepath = os.path.join(input_dir, output_filename)
+            with open(output_filepath, 'w', encoding='utf-8') as f:
+                f.write(merged_content)
+            
+            merger_instance.logger.info(f"合并完成! 结果已保存至 {output_filepath}")
+            return merged_content
+
+        merged_content = process_and_return_merged(merger, session_dir, "merged_output.md")
+
+        session_id = session_state['processing_results']['session_id']
+        download_zip_path = os.path.join(session_dir, f"results_{session_id}.zip")
+        with zipfile.ZipFile(download_zip_path, 'a', zipfile.ZIP_DEFLATED) as zipf:
+            zipf.write(os.path.join(session_dir, "merged_output.md"), "merged_output.md")
+
+        return merged_content
+
+    except Exception as e:
+        print(f"[ERROR] Failed to merge and clean pages: {e}")
+        return f"An error occurred during the merge process: {e}"
 
 # --- Gradio Interface Creation ----------------------------------------------
 def create_gradio_interface():
@@ -432,6 +771,8 @@ def create_gradio_interface():
                                 md_raw_output = gr.Textbox("...", label="Markdown Raw Text", lines=38, show_copy_button=True, show_label=False)
                             with gr.TabItem("Current Page JSON"):
                                 current_page_json = gr.Textbox("...", label="Current Page JSON", lines=38, show_copy_button=True, show_label=False)
+                            with gr.TabItem("Merged Output"):
+                                merged_output = gr.Markdown("## Processing will automatically merge pages...", elem_id="markdown_output")
                 
                 download_btn = gr.DownloadButton("⬇️ Download Results", visible=False)
 
@@ -447,8 +788,9 @@ def create_gradio_interface():
         process_btn.click(
             fn=process_file_local,
             inputs=[session_token, test_image_input, file_input, prompt_mode],
-            outputs=[result_image, info_display, md_output, md_raw_output, download_btn, page_info, current_page_json, session_state_component, session_token]
+            outputs=[result_image, info_display, md_output, md_raw_output, download_btn, page_info, current_page_json, session_state_component, session_token, merged_output]
         )
+
         clear_btn.click(
             fn=clear_all_data, inputs=[session_state_component],
             outputs=[file_input, test_image_input, result_image, info_display, md_output, md_raw_output, download_btn, page_info, current_page_json, session_state_component]
@@ -456,23 +798,45 @@ def create_gradio_interface():
     return demo
 
 # --- Main Program Execution -------------------------------------------------
+def load_model():
+    """Loads the model and processor."""
+    global MODEL, PROCESSOR
+    if MODEL is None or PROCESSOR is None:
+        print(f"[INFO] Loading model from '{MODEL_DIR}' onto device '{DEVICE}'...")
+        try:
+            config = get_model_config(MODEL_DIR)
+            MODEL, PROCESSOR = load_model_and_processor(MODEL_DIR, config, DTYPE, MIN_PIX_MODEL, MAX_PIX_MODEL)
+            MODEL.to(DEVICE)
+            if DEVICE == "mps":
+                patch_vision_tower(MODEL)
+            print("[INFO] Model loaded successfully.")
+        except Exception as e:
+            print(f"[ERROR] Failed to load the model: {e}")
+            # We don't exit here, as we might want to retry or handle it in the UI
+            MODEL = None
+            PROCESSOR = None
+
+def unload_model():
+    """Unloads the model to free up memory."""
+    global MODEL, PROCESSOR
+    if MODEL is not None:
+        print("[INFO] Unloading model to free up memory...")
+        del MODEL
+        del PROCESSOR
+        MODEL = None
+        PROCESSOR = None
+        gc.collect()
+        if DEVICE == "mps":
+            torch.mps.empty_cache()
+        print("[INFO] Model unloaded.")
+
 if __name__ == "__main__":
     print("[INFO] Starting local M1 Gradio demo...")
     if not os.path.exists(MODEL_DIR):
         print(f"[ERROR] Model directory not found at '{MODEL_DIR}'. Please download the model first.")
         sys.exit(1)
 
-    print(f"[INFO] Loading model from '{MODEL_DIR}' onto device '{DEVICE}'...")
-    try:
-        config = get_model_config(MODEL_DIR)
-        MODEL, PROCESSOR = load_model_and_processor(MODEL_DIR, config, DTYPE, MIN_PIX_MODEL, MAX_PIX_MODEL)
-        MODEL.to(DEVICE)
-        if DEVICE == "mps":
-            patch_vision_tower(MODEL)
-        print("[INFO] Model loaded successfully.")
-    except Exception as e:
-        print(f"[ERROR] Failed to load the model: {e}")
-        sys.exit(1)
+    load_model()
 
     app = FastAPI()
 
