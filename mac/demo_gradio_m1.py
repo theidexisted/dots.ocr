@@ -541,11 +541,9 @@ def get_or_create_session(token=None):
     return token, SESSIONS[token]
 
 # --- Core Local Inference Function ------------------------------------------
-def process_file_local(session_token, test_image_input, file_input, prompt_mode):
-    # --- Hardcoded API and Model for automatic merging ---
-    API_BASE = "http://127.0.0.1:1234/v1/"
-    MODEL_NAME = "openai/gpt-oss-20b"
-
+# --- Core Local Inference Function ------------------------------------------
+def _setup_processing_session(session_token, test_image_input, file_input):
+    """Handles session creation, input validation, and file loading."""
     if not session_token:
         session_token, _ = get_or_create_session()
 
@@ -553,17 +551,12 @@ def process_file_local(session_token, test_image_input, file_input, prompt_mode)
     session_state['processing_results']['status'] = 'processing'
 
     if not MODEL or not PROCESSOR:
-        session_state['processing_results']['status'] = 'error'
-        yield None, "Error: Model not loaded. Check console for errors.", "", "", gr.update(value=None), None, "", session_state, session_token, ""
-        return
+        return session_token, session_state, None, None, None, "Error: Model not loaded. Check console for errors."
 
     input_path = file_input if file_input else test_image_input
     if not input_path:
-        session_state['processing_results']['status'] = 'error'
-        yield None, "Please upload a file or select an example.", "", "", gr.update(value=None), None, "", session_state, session_token, ""
-        return
+        return session_token, session_state, None, None, None, "Please upload a file or select an example."
 
-    # Setup session directory
     session_id = session_token
     session_dir = create_session_dir(session_id)
     abs_session_dir = os.path.abspath(session_dir)
@@ -573,102 +566,68 @@ def process_file_local(session_token, test_image_input, file_input, prompt_mode)
     pdf_cache = session_state['pdf_cache']
     images_to_process = pdf_cache.get("images", [])
     original_sizes = pdf_cache.get("original_sizes", [])
-    if not images_to_process: # If file wasn't previewed, load it now
+    if not images_to_process:
         _, _, session_state = load_file_for_preview(input_path, session_state)
         images_to_process = session_state['pdf_cache'].get("images", [])
         original_sizes = session_state['pdf_cache'].get("original_sizes", [])
 
-    prompt_text = dict_promptmode_to_prompt.get(prompt_mode, "")
-    all_results = []
-    all_md_content = []
+    return session_token, session_state, images_to_process, original_sizes, abs_session_dir, None
+
+def _process_single_page(img, page_num, prompt_text, session_dir, original_size):
+    """Runs inference on a single page and saves the artifacts."""
+    out_text = None
+    try:
+        inputs = prepare_inputs(img, prompt_text, PROCESSOR, DEVICE, DTYPE)
+        out_ids = run_inference(MODEL, inputs)
+        out_text = decode_output(out_ids, inputs, PROCESSOR)
+        
+        parsed_json = parse_json_flex(out_text)
+        
+        if isinstance(parsed_json, list):
+            page_info = {"blocks": parsed_json}
+        else:
+            page_info = parsed_json
+
+        page_info = filter_json_blocks(page_info)
+
+        original_width, original_height = original_size
+        img_for_md = img.resize((int(original_width), int(original_height)))
+
+        page_info.update({"page": page_num, "width": img_for_md.width, "height": img_for_md.height})
+        
+        md_content_base64 = layoutjson2md(img_for_md, page_info.get('blocks', []), text_key='text')
+        md_content_paths = extract_and_save_images(md_content_base64, session_dir, page_num)
+
+        current_page_result = {'json_data': page_info, 'md_content': md_content_paths}
+
+        # Save artifacts
+        json_path = os.path.join(session_dir, f"page_{page_num:03d}.json")
+        md_path = os.path.join(session_dir, f"page_{page_num:03d}.md")
+        with open(json_path, "w", encoding="utf-8") as f: json.dump(page_info, f, ensure_ascii=False, indent=2)
+        with open(md_path, "w", encoding="utf-8") as f: f.write(md_content_paths)
+
+        return current_page_result, md_content_paths
+    except Exception as e:
+        error_message = f"Failed to process page {page_num}: {e}, output: {out_text}"
+        print(f"[ERROR] {error_message}")
+        current_page_result = {'json_data': {'error': error_message}, 'md_content': f"## {error_message}"}
+        md_content = f"## {error_message}"
+        return current_page_result, md_content
+    finally:
+        # Clean up memory after each page
+        if 'inputs' in locals(): del inputs
+        if 'out_ids' in locals(): del out_ids
+        gc.collect()
+        if DEVICE == "mps": torch.mps.empty_cache()
+
+def _finalize_and_package_results(session_state, initial_info_text, all_md_content, images_to_process, all_results, session_token):
+    """Merges pages, creates a zip archive, and yields the final UI update."""
+    # --- Hardcoded API and Model for automatic merging ---
+    API_BASE = "http://127.0.0.1:1234/v1/"
+    MODEL_NAME = "openai/gpt-oss-20b"
     total_pages = len(images_to_process)
-    
-    # Initial message with output location
-    initial_info_text = f"**Output Location:** `{abs_session_dir}`\n\n**Local Inference Details:**\n- Device: {DEVICE}\n- Total Pages: {total_pages}\n- Session ID: {session_id}"
+    combined_md = "\n\n---\n\n".join(all_md_content)
 
-    for i, img in enumerate(images_to_process):
-        page_num = i + 1
-        
-        # Update UI to show progress before processing
-        info_text = f"{initial_info_text}\n\n**Processing page {page_num}/{total_pages}...**"
-        page_info_html = f"<div id='page_info_box'>{page_num} / {total_pages}</div>"
-        processing_md = "\n\n---\n\n".join(all_md_content) + f"\n\n---\n\n*⏳ Processing page {page_num}...*"
-        
-        yield (
-            img, info_text, processing_md, processing_md,
-            gr.update(visible=False), page_info_html, "Processing...", session_state, session_token, ""
-        )
-
-        out_text = None
-        try:
-            inputs = prepare_inputs(img, prompt_text, PROCESSOR, DEVICE, DTYPE)
-            out_ids = run_inference(MODEL, inputs)
-            out_text = decode_output(out_ids, inputs, PROCESSOR)
-            
-            parsed_json = parse_json_flex(out_text)
-            
-            # Normalize the structure to always be a dictionary with a 'blocks' key
-            if isinstance(parsed_json, list):
-                page_info = {"blocks": parsed_json}
-            else:
-                page_info = parsed_json
-
-            # Now, filter the blocks within the unified structure
-            page_info = filter_json_blocks(page_info)
-
-            original_width, original_height = original_sizes[i]
-            #img_for_md = img.resize([0, 0, original_width, original_height])
-            img_for_md = img.resize((int(original_width), int(original_height)))
-
-            page_info.update({"page": page_num, "width": img_for_md.width, "height": img_for_md.height})
-            
-            md_content = layoutjson2md(img_for_md, page_info.get('blocks', []), text_key='text')
-            
-            current_page_result = {'json_data': page_info, 'md_content': md_content}
-            all_results.append(current_page_result)
-            all_md_content.append(md_content)
-
-            # Save artifacts
-            json_path = os.path.join(session_dir, f"page_{page_num:03d}.json")
-            md_path = os.path.join(session_dir, f"page_{page_num:03d}.md")
-            with open(json_path, "w", encoding="utf-8") as f: json.dump(page_info, f, ensure_ascii=False, indent=2)
-            # split image files from markdown and save them separately
-            md_content = extract_and_save_images(md_content, session_dir, page_num)
-            with open(md_path, "w", encoding="utf-8") as f: f.write(md_content)
-
-        except Exception as e:
-            print(f"[ERROR] Failed to process page {page_num}: {e}, output: {out_text}")
-            error_message = f"Failed to process page {page_num}: {e}, output: {out_text}"
-            current_page_result = {'json_data': {'error': error_message}, 'md_content': f"## {error_message}"}
-            all_results.append(current_page_result)
-            all_md_content.append(f"## {error_message}")
-        finally:
-            # Clean up memory after each page
-            if 'inputs' in locals(): del inputs
-            if 'out_ids' in locals(): del out_ids
-            gc.collect()
-            if DEVICE == "mps": torch.mps.empty_cache()
-
-        # Update session state after processing the page
-        pdf_cache["results"] = all_results
-        pdf_cache["current_page"] = i
-        session_state['pdf_cache'] = pdf_cache
-
-        # Yield the result for the current page
-        combined_md = "\n\n---\n\n".join(all_md_content)
-        current_page_json_str = json.dumps(current_page_result.get('json_data', {}), ensure_ascii=False, indent=2)
-        
-        yield (
-            img, info_text, combined_md, combined_md,
-            gr.update(visible=False), page_info_html, current_page_json_str, session_state, session_token, ""
-        )
-
-    # After the loop, do final updates
-    pdf_cache.update({"is_parsed": True, "results": all_results, "current_page": 0})
-    session_state['pdf_cache'] = pdf_cache
-    session_state['processing_results']['status'] = 'completed'
-
-    # --- Automatic Merging and Cleaning ---
     info_text = f"{initial_info_text}\n\n**✅ Processing complete. Now merging and cleaning...**"
     yield (
         images_to_process[0] if images_to_process else None, info_text, combined_md, combined_md,
@@ -682,6 +641,8 @@ def process_file_local(session_token, test_image_input, file_input, prompt_mode)
     load_model()
 
     # Create zip for download
+    session_dir = session_state['processing_results']['temp_dir']
+    session_id = session_state['processing_results']['session_id']
     original_filename = session_state.get('original_filename')
     if original_filename:
         zip_basename = os.path.splitext(original_filename)[0]
@@ -697,7 +658,6 @@ def process_file_local(session_token, test_image_input, file_input, prompt_mode)
 
     # Final yield to set the first page view and enable download
     final_info_text = f"{initial_info_text}\n\n**✅ Processing and merging complete.**"
-    combined_md = "\n\n---\n\n".join(all_md_content)
     first_page_json_str = json.dumps(all_results[0].get('json_data', {}), ensure_ascii=False, indent=2) if all_results else "{}"
     first_image = images_to_process[0] if images_to_process else None
     
@@ -707,6 +667,70 @@ def process_file_local(session_token, test_image_input, file_input, prompt_mode)
         f"<div id='page_info_box'>1 / {total_pages}</div>",
         first_page_json_str, session_state, session_token, merged_content
     )
+
+def process_file_local(session_token, test_image_input, file_input, prompt_mode):
+    # 1. Setup
+    session_token, session_state, images_to_process, original_sizes, abs_session_dir, error = \
+        _setup_processing_session(session_token, test_image_input, file_input)
+
+    if error:
+        session_state['processing_results']['status'] = 'error'
+        yield None, error, "", "", gr.update(value=None), None, "", session_state, session_token, ""
+        return
+
+    # 2. Processing Loop
+    prompt_text = dict_promptmode_to_prompt.get(prompt_mode, "")
+    all_results = []
+    all_md_content = []
+    total_pages = len(images_to_process)
+    session_id = session_token
+    initial_info_text = f"**Output Location:** `{abs_session_dir}`\n\n**Local Inference Details:**\n- Device: {DEVICE}\n- Total Pages: {total_pages}\n- Session ID: {session_id}"
+
+    for i, img in enumerate(images_to_process):
+        page_num = i + 1
+        
+        # Update UI to show progress before processing
+        info_text = f"{initial_info_text}\n\n**Processing page {page_num}/{total_pages}...**"
+        page_info_html = f"<div id='page_info_box'>{page_num} / {total_pages}</div>"
+        processing_md = "\n\n---\n\n".join(all_md_content) + f"\n\n---\n\n*⏳ Processing page {page_num}...*"
+        
+        yield (
+            img, info_text, processing_md, processing_md,
+            gr.update(visible=False), page_info_html, "Processing...", session_state, session_token, ""
+        )
+
+        current_page_result, md_content = _process_single_page(
+            img, page_num, prompt_text, session_state['processing_results']['temp_dir'], original_sizes[i]
+        )
+        
+        all_results.append(current_page_result)
+        all_md_content.append(md_content)
+
+        # Update session state after processing the page
+        pdf_cache = session_state['pdf_cache']
+        pdf_cache["results"] = all_results
+        pdf_cache["current_page"] = i
+        session_state['pdf_cache'] = pdf_cache
+
+        # Yield the result for the current page
+        combined_md = "\n\n---\n\n".join(all_md_content)
+        current_page_json_str = json.dumps(current_page_result.get('json_data', {}), ensure_ascii=False, indent=2)
+        
+        yield (
+            img, info_text, combined_md, combined_md,
+            gr.update(visible=False), page_info_html, current_page_json_str, session_state, session_token, ""
+        )
+
+    # 3. Finalization
+    pdf_cache = session_state['pdf_cache']
+    pdf_cache.update({"is_parsed": True, "results": all_results, "current_page": 0})
+    session_state['pdf_cache'] = pdf_cache
+    session_state['processing_results']['status'] = 'completed'
+
+    yield from _finalize_and_package_results(
+        session_state, initial_info_text, all_md_content, images_to_process, all_results, session_token
+    )
+
 
 def merge_and_clean_pages_auto(session_state, api_base, model_name):
     session_dir = session_state['processing_results'].get('temp_dir')
