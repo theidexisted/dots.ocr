@@ -4,6 +4,9 @@ Gradio Demo for dots.ocr on macOS/M1
 - Self-contained, no external server needed.
 - Based on the original Gradio demo and the M1 command-line script.
 '''
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import gradio as gr
 import json
@@ -32,6 +35,7 @@ import logging
 from tqdm import tqdm
 import glob
 from typing import List, Tuple
+from contextlib import asynccontextmanager
 
 pageLimit = 0
 
@@ -113,7 +117,7 @@ class PDFMerger:
     def remove_unnecessary_spaces(self, content: str, file_path: str) -> str:
         """使用AI删除正文中不应该存在的空格"""
         prompt = f"""
-请处理以下 markdown 文本，删除正文中不应该存在的空格，但保留标题、列表等特殊格式中的空格。
+请处理以下 markdown 文本，删除正文中不应该存在的空格，但保留标题、列表等特殊格式中的空格。同时处理一下图片说明文字，把图片下面的说文字移动到 markdown 的 caption 位置
 
 处理规则：
 1. 删除中文文本中不必要的空格（中文通常不需要单词间的空格）
@@ -123,6 +127,23 @@ class PDFMerger:
 5. 保留标点符号周围的正常格式
 6. 修复标题换行问题，确保标题都是单独一行，且标题前后有空行
 7. 同时注意标题是否中间混入了 # 字符，如果有请删掉
+
+
+对于图片说明的处理示例：
+
+```
+![](page_001_image_1.png)
+
+图2-1局部反映整体
+```
+
+修改为：
+
+```
+![图2-1局部反映整体](page_001_image_1.png)
+```
+
+
 
 请直接返回处理后的文本，不要添加任何解释。
 
@@ -307,10 +328,12 @@ MAX_PIX_MODEL = 640 * 28 * 28 * 4
 MODEL = None
 PROCESSOR = None
 SESSIONS = {}
+DPI=200
 
 # --- M1/MPS-specific Helpers from m1.py -------------------------------------
-def pil_from_page(page, dpi=200):
-    pix = page.get_pixmap(dpi=dpi)
+def pil_from_page(page, dpi=DPI):
+    #pix = page.get_pixmap(dpi=dpi)
+    pix = page.get_pixmap()
     return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
 
@@ -393,14 +416,15 @@ def extract_and_save_images(md_content, base_path, page_num):
     Extracts base64 embedded images from markdown, saves them as files,
     and replaces the base64 URI with a file path.
     """
-    # Make the image type in the regex optional. It now handles "data:image/jpeg;base64,..." and "data:image;base64,..."
-    img_pattern = re.compile(r"!\[(.*?)\]\(data:image;base64,(.*?)\)")
+    # 修正后的正则表达式，正确捕获图片类型和base64数据
+    img_pattern = re.compile(r'!\[(.*?)\]\(data:image(?:\/(\w+))?;base64,([^)]+)\)')
     matches = list(img_pattern.finditer(md_content))
     
+    print(len(matches))
     for i, match in enumerate(matches):
-        alt_text = match.group(1)
-        img_type = match.group(3).lower()
-        b64_data = match.group(4)
+        alt_text = match.group(1)  # 第一个捕获组是alt文本
+        img_type = match.group(2)  # 第二个捕获组是图片类型(如果有)
+        b64_data = match.group(3)  # 第三个捕获组是base64数据
         
         img_bytes = base64.b64decode(b64_data)
         
@@ -410,7 +434,7 @@ def extract_and_save_images(md_content, base_path, page_num):
                     img_type = img.format.lower()
             except Exception as e:
                 print(f"Could not determine image type with Pillow: {e}")
-                img_type = 'jpeg' # Default to jpeg if detection fails
+                img_type = 'jpeg'  # Default to jpeg if detection fails
 
         # Create a unique filename
         img_filename = f"page_{page_num:03d}_image_{i+1}.{img_type}"
@@ -423,15 +447,16 @@ def extract_and_save_images(md_content, base_path, page_num):
         md_content = md_content.replace(match.group(0), f"![{alt_text}]({img_filename})")
         
     return md_content
-
+                                    
 # --- Gradio App Helpers (Adapted from demo_gradio.py) -----------------------
 def get_initial_session_state():
     return {
         'processing_results': { 'temp_dir': None, 'session_id': None, 'status': 'idle' },
         'pdf_cache': {
             "images": [], "current_page": 0, "total_pages": 0,
-            "file_type": None, "is_parsed": False, "results": []
-        }
+            "file_type": None, "is_parsed": False, "results": [], "original_sizes": []
+        },
+        'original_filename': None
     }
 
 def create_session_dir(session_id):
@@ -447,20 +472,29 @@ def load_file_for_preview(file_path, session_state):
     if not file_path or not os.path.exists(file_path):
         return None, "<div id='page_info_box'>0 / 0</div>", session_state
     
+    session_state['original_filename'] = os.path.basename(file_path)
+    
     file_ext = os.path.splitext(file_path)[1].lower()
+    pages = []
+    original_sizes = []
     try:
         if file_ext == '.pdf':
-            pages = [pil_from_page(p, dpi=200) for p in fitz.open(file_path)]
+            doc = fitz.open(file_path)
+            for p in doc:
+                pages.append(pil_from_page(p, dpi=DPI))
+                original_sizes.append((p.rect.width, p.rect.height))
             pdf_cache["file_type"] = "pdf"
         elif file_ext in ['.jpg', '.jpeg', '.png']:
-            pages = [Image.open(file_path)]
+            img = Image.open(file_path)
+            pages = [img]
+            original_sizes = [(img.width, img.height)]
             pdf_cache["file_type"] = "image"
         else:
             return None, "<div id='page_info_box'>Unsupported</div>", session_state
     except Exception as e:
         return None, f"<div id='page_info_box'>Load failed: {e}</div>", session_state
     
-    pdf_cache.update({"images": pages, "current_page": 0, "total_pages": len(pages), "is_parsed": False, "results": []})
+    pdf_cache.update({"images": pages, "original_sizes": original_sizes, "current_page": 0, "total_pages": len(pages), "is_parsed": False, "results": []})
     return pages[0], f"<div id='page_info_box'>1 / {len(pages)}</div>", session_state
 
 def turn_page(direction, session_state):
@@ -538,9 +572,11 @@ def process_file_local(session_token, test_image_input, file_input, prompt_mode)
 
     pdf_cache = session_state['pdf_cache']
     images_to_process = pdf_cache.get("images", [])
+    original_sizes = pdf_cache.get("original_sizes", [])
     if not images_to_process: # If file wasn't previewed, load it now
         _, _, session_state = load_file_for_preview(input_path, session_state)
         images_to_process = session_state['pdf_cache'].get("images", [])
+        original_sizes = session_state['pdf_cache'].get("original_sizes", [])
 
     prompt_text = dict_promptmode_to_prompt.get(prompt_mode, "")
     all_results = []
@@ -580,10 +616,13 @@ def process_file_local(session_token, test_image_input, file_input, prompt_mode)
             # Now, filter the blocks within the unified structure
             page_info = filter_json_blocks(page_info)
 
-            page_info.update({"page": page_num, "width": img.width, "height": img.height})
+            original_width, original_height = original_sizes[i]
+            #img_for_md = img.resize([0, 0, original_width, original_height])
+            img_for_md = img.resize((int(original_width), int(original_height)))
+
+            page_info.update({"page": page_num, "width": img_for_md.width, "height": img_for_md.height})
             
-            md_content = layoutjson2md(img, page_info.get('blocks', []), text_key='text')
-            md_content = extract_and_save_images(md_content, session_dir, page_num)
+            md_content = layoutjson2md(img_for_md, page_info.get('blocks', []), text_key='text')
             
             current_page_result = {'json_data': page_info, 'md_content': md_content}
             all_results.append(current_page_result)
@@ -593,6 +632,8 @@ def process_file_local(session_token, test_image_input, file_input, prompt_mode)
             json_path = os.path.join(session_dir, f"page_{page_num:03d}.json")
             md_path = os.path.join(session_dir, f"page_{page_num:03d}.md")
             with open(json_path, "w", encoding="utf-8") as f: json.dump(page_info, f, ensure_ascii=False, indent=2)
+            # split image files from markdown and save them separately
+            md_content = extract_and_save_images(md_content, session_dir, page_num)
             with open(md_path, "w", encoding="utf-8") as f: f.write(md_content)
 
         except Exception as e:
@@ -641,7 +682,13 @@ def process_file_local(session_token, test_image_input, file_input, prompt_mode)
     load_model()
 
     # Create zip for download
-    download_zip_path = os.path.join(session_dir, f"results_{session_id}.zip")
+    original_filename = session_state.get('original_filename')
+    if original_filename:
+        zip_basename = os.path.splitext(original_filename)[0]
+        download_zip_path = os.path.join(session_dir, f"{zip_basename}.zip")
+    else:
+        download_zip_path = os.path.join(session_dir, f"results_{session_id}.zip")
+
     with zipfile.ZipFile(download_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
         for root, _, files in os.walk(session_dir):
             for file in files:
@@ -767,8 +814,8 @@ def create_gradio_interface():
                         with gr.Tabs():
                             with gr.TabItem("Markdown Render"):
                                 md_output = gr.Markdown("## Click 'Parse Locally' to begin...", elem_id="markdown_output", latex_delimiters=[{"left": "$", "right": "$", "display": True}])
-                            with gr.TabItem("Markdown Raw"):
-                                md_raw_output = gr.Textbox("...", label="Markdown Raw Text", lines=38, show_copy_button=True, show_label=False)
+                            with gr.TabItem("Markdown Raw (Editable)"):
+                                md_raw_output = gr.Textbox("...", label="Markdown Raw Text", lines=38, show_copy_button=True, show_label=False, interactive=True)
                             with gr.TabItem("Current Page JSON"):
                                 current_page_json = gr.Textbox("...", label="Current Page JSON", lines=38, show_copy_button=True, show_label=False)
                             with gr.TabItem("Merged Output"):
@@ -777,6 +824,7 @@ def create_gradio_interface():
                 download_btn = gr.DownloadButton("⬇️ Download Results", visible=False)
 
         # Event Handlers
+        md_raw_output.change(fn=lambda x: x, inputs=md_raw_output, outputs=md_output)
         demo.load(on_load, None, [session_token, session_state_component])
         prompt_mode.change(fn=update_prompt_display, inputs=prompt_mode, outputs=prompt_display)
         file_input.upload(fn=load_file_for_preview, inputs=[file_input, session_state_component], outputs=[result_image, page_info, session_state_component])
@@ -805,7 +853,7 @@ def load_model():
         print(f"[INFO] Loading model from '{MODEL_DIR}' onto device '{DEVICE}'...")
         try:
             config = get_model_config(MODEL_DIR)
-            MODEL, PROCESSOR = load_model_and_processor(MODEL_DIR, config, DTYPE, MIN_PIX_MODEL, MAX_PIX_MODEL)
+            MODEL, PROCESSOR = load_model_and_processor(MODEL_DIR, config, DTYPE, MIN_PIXELS, MAX_PIX_MODEL)
             MODEL.to(DEVICE)
             if DEVICE == "mps":
                 patch_vision_tower(MODEL)
@@ -830,15 +878,46 @@ def unload_model():
             torch.mps.empty_cache()
         print("[INFO] Model unloaded.")
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Handles startup and shutdown events for the FastAPI application.
+    """
+    # --- Startup ---
+    print("[INFO] Application startup: Loading model...")
+    load_model()
+    yield
+    # --- Shutdown ---
+    print("\n[INFO] Application shutdown: Cleaning up resources...")
+    unload_model()
+    
+    session_root = "gradio_output"
+    if os.path.exists(session_root):
+        print(f"[INFO] Removing all session data from '{session_root}'...")
+        try:
+            shutil.rmtree(session_root)
+            print("[INFO] Session data removed successfully.")
+        except OSError as e:
+            print(f"[ERROR] Failed to remove session data: {e}")
+            
+    print("[INFO] Cleanup complete. Exiting.")
+
+
 if __name__ == "__main__":
+    import signal
+
+    def force_shutdown(signum, frame):
+        print("\n[INFO] Ctrl+C detected. Forcefully shutting down.")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, force_shutdown)
+
     print("[INFO] Starting local M1 Gradio demo...")
     if not os.path.exists(MODEL_DIR):
         print(f"[ERROR] Model directory not found at '{MODEL_DIR}'. Please download the model first.")
         sys.exit(1)
 
-    load_model()
-
-    app = FastAPI()
+    app = FastAPI(lifespan=lifespan)
 
     @app.get("/api/job/{token}")
     def get_job_status(token: str):
@@ -852,7 +931,7 @@ if __name__ == "__main__":
 
     demo = create_gradio_interface()
     app = gr.mount_gradio_app(app, demo, path="/gradio")
-    
+
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 7860
     print(f"[INFO] Launching Gradio interface on http://0.0.0.0:{port}/gradio")
     uvicorn.run(app, host="0.0.0.0", port=port)
