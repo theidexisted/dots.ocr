@@ -31,6 +31,9 @@ import torch
 from transformers import AutoConfig, AutoProcessor, AutoModelForCausalLM
 from openai import OpenAI
 import logging
+import multiprocessing
+import queue
+logging.getLogger("transformers").setLevel(logging.ERROR)
 
 # Local tool imports
 from dots_ocr.utils import dict_promptmode_to_prompt
@@ -70,7 +73,8 @@ PROCESSOR = None
 
 # --- M1/MPS-specific Helpers from m1.py -------------------------------------
 def pil_from_page(page, dpi=DPI):
-    pix = page.get_pixmap()
+    pix = page.get_pixmap(dpi=dpi)
+    #pix = page.get_pixmap()
     return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
 def filter_json_blocks(obj, drop_headers_footers = True):
@@ -146,7 +150,7 @@ def decode_output(out_ids, inputs, processor):
     return processor.batch_decode(trimmed_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
 
 def extract_and_save_images(md_content, base_path, page_num):
-    img_pattern = re.compile(r'!\[(.*?)\]\(data:image(?:\/(\w+))?;base64,([^)]+)\)')
+    img_pattern = re.compile(r'!\\[(.*?)\\]\(data:image(?:\/(\w+))?;base64,([^)]+)\)')
     matches = list(img_pattern.finditer(md_content))
     
     for i, match in enumerate(matches):
@@ -179,13 +183,20 @@ def load_model():
         print(f"[INFO] Loading model from '{MODEL_DIR}' onto device '{DEVICE}'...")
         try:
             config = get_model_config(MODEL_DIR)
+            print("[WORKER-DEBUG] Loading model and processor...")
             MODEL, PROCESSOR = load_model_and_processor(MODEL_DIR, config, DTYPE, MIN_PIXELS, MAX_PIX_MODEL)
+            print(f"[WORKER-DEBUG] Moving model to {DEVICE}...")
             MODEL.to(DEVICE)
+            print("[WORKER-DEBUG] Model moved to device.")
             if DEVICE == "mps":
+                print("[WORKER-DEBUG] Patching vision tower for MPS...")
                 patch_vision_tower(MODEL)
+                print("[WORKER-DEBUG] Vision tower patched.")
             print("[INFO] Model loaded successfully.")
         except Exception as e:
+            import traceback
             print(f"[ERROR] Failed to load the model: {e}")
+            traceback.print_exc()
             MODEL = None
             PROCESSOR = None
 
@@ -201,6 +212,149 @@ def unload_model():
         gc.collect()
         if DEVICE == "mps": torch.mps.empty_cache()
         print("[INFO] Model unloaded.")
+
+# --- Child Process Inference ---
+
+INFERENCE_TIMEOUT = 120  # 2 minutes in seconds
+
+def inference_worker(in_queue: multiprocessing.Queue, out_queue: multiprocessing.Queue):
+    """
+    Worker process that loads the model and runs inference on jobs from the queue.
+    This function runs in a separate process.
+    """
+    print("[WORKER] Starting and loading model...")
+    load_model()
+    if not MODEL or not PROCESSOR:
+        print("[WORKER-ERROR] Model failed to load. Worker will not process jobs.")
+        # Parent process will time out and handle restart.
+        return
+
+    print("[WORKER] Model loaded. Waiting for jobs.")
+    while True:
+        try:
+            job = in_queue.get()
+            if job is None:  # Sentinel for shutdown
+                break
+
+            #print("*** get job result") # delete me
+            img, prompt_text = job
+            try:
+                inputs = prepare_inputs(img, prompt_text, PROCESSOR, DEVICE, DTYPE)
+                out_ids = run_inference(MODEL, inputs)
+                out_text = decode_output(out_ids, inputs, PROCESSOR)
+                parsed_json = parse_json_flex(out_text)
+                out_queue.put((parsed_json, out_text))
+            except Exception as e:
+                out_queue.put(e)  # Send exception back to the parent
+            finally:
+                # Cleanup to manage memory in the worker
+                if 'inputs' in locals(): del inputs
+                if 'out_ids' in locals(): del out_ids
+                gc.collect()
+                if DEVICE == "mps": torch.mps.empty_cache()
+
+        except (KeyboardInterrupt, SystemExit):
+            break
+    
+    print("[WORKER] Shutting down.")
+    unload_model()
+
+
+class OcrWorkerManager:
+    """Manages the lifecycle of the OCR worker process."""
+    def __init__(self):
+        # Using 'spawn' is safer on macOS with libraries like PyTorch.
+        ctx = multiprocessing.get_context('spawn')
+        self.in_queue = ctx.Queue()
+        self.out_queue = ctx.Queue()
+        self.process = None
+        self.ctx = ctx
+        self.start_worker()
+
+    def start_worker(self):
+        if self.process and self.process.is_alive():
+            return
+        print("[INFO] Starting OCR worker process...")
+        self.process = self.ctx.Process(
+            target=inference_worker,
+            args=(self.in_queue, self.out_queue)
+        )
+        self.process.start()
+
+    def stop_worker(self):
+        if self.process and self.process.is_alive():
+            print("[INFO] Stopping OCR worker process...")
+            try:
+                self.in_queue.put(None)
+                self.process.join(timeout=10)
+                if self.process.is_alive():
+                    print("[WARNING] Worker process did not shut down gracefully. Terminating.")
+                    self.process.terminate()
+                    self.process.join(5)
+            except Exception as e:
+                print(f"[ERROR] Error while stopping worker: {e}")
+        self.process = None
+
+    def restart_worker(self):
+        print("[INFO] Restarting OCR worker process...")
+        if self.process and self.process.is_alive():
+            self.process.terminate()
+            self.process.join(timeout=10)
+
+        # Clear any stale items from queues
+        while not self.in_queue.empty():
+            try: self.in_queue.get_nowait() # type: ignore
+            except queue.Empty: break
+        while not self.out_queue.empty():
+            try: self.out_queue.get_nowait() # type: ignore
+            except queue.Empty: break
+            
+        self.start_worker()
+
+    def run_inference(self, img, prompt_text):
+        """Sends a job to the worker and waits for the result with a timeout."""
+        if not self.process or not self.process.is_alive():
+            print("[WARNING] Worker process is not running. Attempting to restart.")
+            self.restart_worker()
+
+        self.in_queue.put((img, prompt_text))
+        #print("*** put job done") # delete me
+        try:
+            result = self.out_queue.get(timeout=INFERENCE_TIMEOUT)
+            #print("[MANAGER] Result received from worker.")
+            if isinstance(result, Exception):
+                raise result
+            return result
+        except queue.Empty:
+            self.restart_worker() # Restart worker on timeout
+            raise TimeoutError(f"Inference timed out after {INFERENCE_TIMEOUT} seconds.")
+
+def run_inference_with_worker_and_retry(worker_manager: OcrWorkerManager, img: Image.Image, prompt_text: str, page_num: int):
+    """
+    Runs inference in a worker process, with timeout and retry logic.
+    If a timeout or worker error occurs, it retries once.
+    """
+    for attempt in range(2):
+        try:
+            # The timeout is handled within run_inference
+            parsed_json, out_text = worker_manager.run_inference(img, prompt_text)
+            return parsed_json, out_text
+        except TimeoutError:
+            print(f"\n[WARNING] Inference timed out on page {page_num} on attempt {attempt + 1}.")
+            if attempt == 0:
+                print("[INFO] Worker has been restarted, retrying...")
+            else:
+                return None, "Inference timed out after retry."
+        except Exception as e:
+            print(f"\n[WARNING] Worker process failed on page {page_num} on attempt {attempt + 1}: {e}")
+            if attempt == 0:
+                # The restart is already handled by the Timeout exception path, but we call it here
+                # for other exceptions to ensure the worker is clean for the next attempt.
+                worker_manager.restart_worker()
+                print("[INFO] Worker has been restarted, retrying...")
+            else:
+                return None, f"Worker process failed after retry: {e}"
+    return None, "Failed to get result from worker after retries."
 
 
 # --- New Command-Line Specific Functions ---
@@ -248,18 +402,21 @@ def get_images_from_path(input_path: str) -> Tuple[List[Image.Image], List[Tuple
 
     return images, original_sizes
 
-def process_page(img: Image.Image, page_num: int, prompt_text: str, output_dir: str, original_size: Tuple[int, int]):
+def process_page(worker_manager: OcrWorkerManager, img: Image.Image, page_num: int, prompt_text: str, output_dir: str, original_size: Tuple[int, int]):
     """
     Runs inference on a single page/image and saves the resulting artifacts.
     """
-    out_text = None
     try:
-        inputs = prepare_inputs(img, prompt_text, PROCESSOR, DEVICE, DTYPE)
-        out_ids = run_inference(MODEL, inputs)
-        out_text = decode_output(out_ids, inputs, PROCESSOR)
-        
-        parsed_json = parse_json_flex(out_text)
-        
+        parsed_json, out_text = run_inference_with_worker_and_retry(worker_manager, img, prompt_text, page_num)
+
+        if parsed_json is None:
+            error_message = f"Failed to process page {page_num} after retry, output: {out_text}"
+            print(f"\n[ERROR] {error_message}")
+            error_file_path = os.path.join(output_dir, f"page_{page_num:03d}_error.txt")
+            with open(error_file_path, "w", encoding="utf-8") as f:
+                f.write(error_message)
+            return
+
         if isinstance(parsed_json, list):
             page_info = {"blocks": parsed_json}
         else:
@@ -271,7 +428,7 @@ def process_page(img: Image.Image, page_num: int, prompt_text: str, output_dir: 
         img_for_md = img.resize((int(original_width), int(original_height)))
 
         page_info.update({"page": page_num, "width": img_for_md.width, "height": img_for_md.height})
-        
+
         md_content_base64 = layoutjson2md(img_for_md, page_info.get('blocks', []), text_key='text')
         md_content_paths = extract_and_save_images(md_content_base64, output_dir, page_num)
 
@@ -284,16 +441,12 @@ def process_page(img: Image.Image, page_num: int, prompt_text: str, output_dir: 
             f.write(md_content_paths)
 
     except Exception as e:
-        error_message = f"Failed to process page {page_num}: {e}, output: {out_text}"
+        error_message = f"An unexpected error occurred while processing page {page_num}: {e}"
         print(f"\n[ERROR] {error_message}")
         error_file_path = os.path.join(output_dir, f"page_{page_num:03d}_error.txt")
         with open(error_file_path, "w", encoding="utf-8") as f:
             f.write(error_message)
-    finally:
-        if 'inputs' in locals(): del inputs
-        if 'out_ids' in locals(): del out_ids
-        gc.collect()
-        if DEVICE == "mps": torch.mps.empty_cache()
+
 
 def main():
     """ Main function to run the batch processing. """
@@ -302,48 +455,81 @@ def main():
         description="Batch OCR processing script using dots.ocr.",
         formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument("input_path", type=str, help="Path to a single file (PDF/image) or a directory of images.")
+    parser.add_argument("input_path", type=str, help="Path to a single file (PDF/image) or a directory of PDFs/images.")
     parser.add_argument("output_dir", type=str, help="Directory to save the output files.")
     parser.add_argument(
-        "--prompt_mode", 
-        type=str, 
+        "--prompt_mode",
+        type=str,
         default="prompt_layout_all_en",
         help="The prompt mode to use. Available modes:\n" + "\n".join(dict_promptmode_to_prompt.keys())
     )
 
     args = parser.parse_args()
 
-    # --- 1. Load Model ---
-    load_model()
-    if not MODEL or not PROCESSOR:
-        print("[ERROR] Model failed to load. Check console for errors. Exiting.")
-        sys.exit(1)
+    # --- 1. Setup OCR Worker ---
+    worker_manager = OcrWorkerManager()
 
-    # --- 2. Get Images ---
-    images, original_sizes = get_images_from_path(args.input_path)
-    if not images:
-        print("[ERROR] No images found to process. Exiting.")
-        unload_model()
-        sys.exit(1)
-    
-    # --- 3. Setup Output ---
-    os.makedirs(args.output_dir, exist_ok=True)
-    print(f"[INFO] Output will be saved to: {os.path.abspath(args.output_dir)}")
+    try:
+        # --- 2. Setup Prompt ---
+        prompt_text = dict_promptmode_to_prompt.get(args.prompt_mode)
+        if not prompt_text:
+            print(f"[ERROR] Invalid prompt_mode: '{args.prompt_mode}'. Use --help to see available modes.")
+            sys.exit(1)
 
-    # --- 4. Process Pages ---
-    prompt_text = dict_promptmode_to_prompt.get(args.prompt_mode)
-    if not prompt_text:
-        print(f"[ERROR] Invalid prompt_mode: '{args.prompt_mode}'. Use --help to see available modes.")
-        unload_model()
-        sys.exit(1)
+        # --- 3. Process Input Path ---
+        page_processed_count = 0
+        reload_interval = 200
 
-    print(f"[INFO] Starting processing for {len(images)} page(s)...")
-    for i, img in enumerate(tqdm(images, desc="Processing pages")):
-        process_page(img, i + 1, prompt_text, args.output_dir, original_sizes[i])
+        if os.path.isdir(args.input_path):
+            pdf_files = glob.glob(os.path.join(args.input_path, "*.pdf"))
+            print(f"[INFO] Found {len(pdf_files)} PDF files in the input directory.")
+            
+            for pdf_path in tqdm(pdf_files, desc="Processing PDF files"):
+                pdf_filename = os.path.splitext(os.path.basename(pdf_path))[0]
+                pdf_output_dir = os.path.join(args.output_dir, pdf_filename)
+                os.makedirs(pdf_output_dir, exist_ok=True)
+                
+                print(f"\n[INFO] Processing: {os.path.basename(pdf_path)}")
+                print(f"[INFO] Output for this PDF will be in: {os.path.abspath(pdf_output_dir)}")
 
-    # --- 5. Unload Model ---
-    unload_model()
-    print(f"\n[INFO] ✅ Batch processing complete. Results are in {os.path.abspath(args.output_dir)}")
+                images, original_sizes = get_images_from_path(pdf_path)
+                if not images:
+                    print(f"[WARNING] No images found in {os.path.basename(pdf_path)}, skipping.")
+                    continue
+
+                print(f"[INFO] Starting processing for {len(images)} page(s) from {os.path.basename(pdf_path)}...")
+                for i, img in enumerate(tqdm(images, desc=f"Pages of {os.path.basename(pdf_path)}")):
+                    process_page(worker_manager, img, i + 1, prompt_text, pdf_output_dir, original_sizes[i])
+                    page_processed_count += 1
+                    if page_processed_count % reload_interval == 0:
+                        print(f"\n[INFO] Processed {page_processed_count} pages, restarting worker for maintenance...")
+                        worker_manager.restart_worker()
+                
+                print(f"[INFO] ✅ Finished processing {os.path.basename(pdf_path)}.")
+
+        elif os.path.isfile(args.input_path):
+            # --- Get Images from single file ---
+            images, original_sizes = get_images_from_path(args.input_path)
+            if not images:
+                print("[ERROR] No images found to process. Exiting.")
+                sys.exit(1)
+            
+            # --- Setup Output for single file ---
+            os.makedirs(args.output_dir, exist_ok=True)
+            print(f"[INFO] Output will be saved to: {os.path.abspath(args.output_dir)}")
+
+            # --- Process Pages for single file ---
+            print(f"[INFO] Starting processing for {len(images)} page(s)...")
+            for i, img in enumerate(tqdm(images, desc="Processing pages")):
+                process_page(worker_manager, img, i + 1, prompt_text, args.output_dir, original_sizes[i])
+        else:
+            print(f"[ERROR] Input path is not a valid file or directory: {args.input_path}")
+            sys.exit(1)
+
+    finally:
+        # --- 5. Stop Worker ---
+        worker_manager.stop_worker()
+        print(f"\n[INFO] ✅ Batch processing complete. Results are in {os.path.abspath(args.output_dir)}")
 
 if __name__ == "__main__":
     main()

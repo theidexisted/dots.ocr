@@ -915,6 +915,7 @@ async def lifespan(app: FastAPI):
     print("\n[INFO] Application shutdown: Cleaning up resources...")
     unload_model()
     
+    return
     session_root = "gradio_output"
     if os.path.exists(session_root):
         print(f"[INFO] Removing all session data from '{session_root}'...")
